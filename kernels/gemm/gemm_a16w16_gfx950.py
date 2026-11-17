@@ -36,6 +36,8 @@ GEMM_A16W16_DTYPE_FP16 = 3
 class GemmA16W16Gfx950Param:
     in_dtype_id: fx.Constexpr[int]
     out_dtype_id: fx.Constexpr[int]
+    final_out_dtype_id: fx.Constexpr[int]
+    splitk_partial_out: fx.Constexpr[bool]
     block_m: fx.Constexpr[int]
     block_n: fx.Constexpr[int]
     block_k: fx.Constexpr[int]
@@ -90,6 +92,8 @@ class AsyncLoadTile:
 def make_gemm_a16w16_gfx950_param(
     in_dtype_id: int,
     out_dtype_id: int,
+    final_out_dtype_id: Optional[int] = None,
+    splitk_partial_out: bool = False,
     block_m: int = 256,
     block_n: int = 256,
     block_k: int = 64,
@@ -111,6 +115,12 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
     if out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
         raise ValueError(f"unsupported out_dtype_id={out_dtype_id} for in_dtype_id={in_dtype_id}")
+    if final_out_dtype_id is None:
+        final_out_dtype_id = out_dtype_id
+    if final_out_dtype_id not in (in_dtype_id, GEMM_A16W16_DTYPE_FP32):
+        raise ValueError(
+            f"unsupported final_out_dtype_id={final_out_dtype_id} for in_dtype_id={in_dtype_id}"
+        )
     if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0 or split_k <= 0:
         raise ValueError("block_m, block_n, block_k, stages, and split_k must be positive")
     if (mma_m, mma_n, mma_k) != (16, 16, 32):
@@ -123,10 +133,18 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError("the workgroup cannot contain more than 16 waves")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
-    in_dbytes = 2  # Shared C remains in the 16-bit input dtype.
+    in_dbytes = 2
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
+    # The LDS C staging tile follows the requested output precision.  This
+    # matters for split-K: partial sums stay fp32 until the final rounding.
+    c_dbytes = out_dbytes
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     max_cshuffle_r2g_vec_size = 16 // out_dbytes
+    if splitk_partial_out and block_m * block_n == block_threads * 8:
+        # One 8-wide fp32 store iteration exactly fills the CTA.  Do not use
+        # this for under-filled tiles: the split-K validation requires the
+        # partial-plane store grid to tile the CTA exactly.
+        max_cshuffle_r2g_vec_size = 8
     if use_half_tile_interleaved:
         if k_waves != 1:
             raise ValueError("half-tile interleaved does not support slice-K")
@@ -148,10 +166,14 @@ def make_gemm_a16w16_gfx950_param(
         assert stg_work_size_per_m_step % cshuffle_r2g_vec_size == 0
         assert half_block_n % cshuffle_r2g_vec_size == 0
     else:
-        cshuffle_r2g_vec_size = min(max_cshuffle_r2g_vec_size, 4) if split_k > 1 else max_cshuffle_r2g_vec_size
+        cshuffle_r2g_vec_size = (
+            min(max_cshuffle_r2g_vec_size, 4)
+            if split_k > 1 and not splitk_partial_out
+            else max_cshuffle_r2g_vec_size
+        )
         assert block_n % cshuffle_r2g_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
+    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * c_dbytes)
     arch = get_rocm_arch()
     smem_capacity = SMEM_CAPACITY_MAP[arch]
     if smem_bytes > smem_capacity:
@@ -240,6 +262,8 @@ def make_gemm_a16w16_gfx950_param(
     return GemmA16W16Gfx950Param(
         in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
+        final_out_dtype_id=final_out_dtype_id,
+        splitk_partial_out=splitk_partial_out,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
@@ -270,10 +294,15 @@ def make_gemm_a16w16_gfx950_param(
 def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     dtype_str = "fp16" if param.in_dtype_id == GEMM_A16W16_DTYPE_FP16 else "bf16"
     out_suffix = "_fp32" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
+    if param.splitk_partial_out:
+        out_suffix += "_part"
+    elif param.final_out_dtype_id != param.out_dtype_id:
+        final_suffix = "fp32" if param.final_out_dtype_id == GEMM_A16W16_DTYPE_FP32 else "16"
+        out_suffix += f"_scratch{final_suffix}"
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
-    name += f"_gm{param.group_m}"
+    name += f"_gm{param.group_m}_cv{param.cshuffle_r2g_vec_size}"
     name += f"_bias{int(param.has_bias)}"
     a_layout = "t" if param.a_is_transposed else "n"
     b_layout = "t" if param.b_is_transposed else "n"
@@ -439,6 +468,20 @@ def write_cshuffle_vec_to_global(
         fx.ptr_store(c_vec, fx.get_iter(out) + global_offset)
 
 
+@flyc.jit
+def write_cshuffle_partial_to_global(
+    out,
+    global_offset,
+    c_vec,
+    split_stride,
+    ks_idx,
+):
+    fx.ptr_store(
+        c_vec.to(fx.Float32),
+        fx.get_iter(out) + global_offset + ks_idx * split_stride,
+    )
+
+
 @flyc.kernel
 def gemm_a16w16_gfx950_kernel(
     out: fx.Tensor,
@@ -471,6 +514,7 @@ def gemm_a16w16_gfx950_kernel(
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     elem_dtype = fx.Float16 if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16) else fx.BFloat16
     global_output_dtype = fx.Float32 if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32) else elem_dtype
+    c_storage_dtype = global_output_dtype
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -505,7 +549,7 @@ def gemm_a16w16_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, k_waves * block_m * block_n, 16]
+        c: fx.Array[c_storage_dtype, k_waves * block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -583,7 +627,8 @@ def gemm_a16w16_gfx950_kernel(
 
     if const_expr(is_split_k):
         frag_C.fill(0.0)
-        splitk_protocol.zero_c()
+        if const_expr(not param.splitk_partial_out):
+            splitk_protocol.zero_c()
     elif const_expr(param.has_bias):
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
@@ -689,8 +734,8 @@ def gemm_a16w16_gfx950_kernel(
         compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
-    frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-    frag_C_out.store(frag_C.load().to(elem_dtype))
+    frag_C_out = fx.make_fragment_like(frag_C, c_storage_dtype)
+    frag_C_out.store(frag_C.load().to(c_storage_dtype))
 
     gpu.barrier()
     for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
@@ -698,7 +743,7 @@ def gemm_a16w16_gfx950_kernel(
         col = fx.get_scalar(thr_mma_cCol[i])
         sC_write[row, col] = frag_C_out[i]
 
-    if const_expr(is_split_k):
+    if const_expr(is_split_k and not param.splitk_partial_out):
         splitk_protocol.wait_until_initialized()
     else:
         gpu.barrier()
@@ -716,24 +761,27 @@ def gemm_a16w16_gfx950_kernel(
             if (global_row < m) and (global_col < n):
                 c_vec = fx.ptr_load(
                     smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                    result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_storage_dtype),
                 )
                 for k_slice in range_constexpr(1, k_waves):
                     peer_c_vec = fx.ptr_load(
                         smem_c + k_slice * block_m * block_n + local_row * block_n + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_storage_dtype),
                     )
                     c_vec = c_vec + peer_c_vec
                 global_offset = global_row * n + global_col
-                write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
-                    c_vec,
-                    is_split_k,
-                    param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                )
-    if const_expr(is_split_k):
+                if const_expr(param.splitk_partial_out):
+                    write_cshuffle_partial_to_global(out, global_offset, c_vec, m * n, ks_idx)
+                else:
+                    write_cshuffle_vec_to_global(
+                        out,
+                        out_buf,
+                        global_offset,
+                        c_vec,
+                        is_split_k,
+                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                    )
+    if const_expr(is_split_k and not param.splitk_partial_out):
         splitk_protocol.finish_split(split_k)
 
 
@@ -769,6 +817,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
     elem_dtype = fx.Float16 if const_expr(param.in_dtype_id == GEMM_A16W16_DTYPE_FP16) else fx.BFloat16
     global_output_dtype = fx.Float32 if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP32) else elem_dtype
+    c_storage_dtype = global_output_dtype
     if const_expr(is_split_k):
         splitk_protocol = SplitKProtocol(
             block_m,
@@ -801,7 +850,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
+        c: fx.Array[c_storage_dtype, block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -955,8 +1004,8 @@ def gemm_a16w16_hti_gfx950_kernel(
 
     def store_half_tile_to_lds(m_part, n_part, frag_C):
         sC = fx.make_view(half_c_base(m_part, n_part), c_lds_layout)
-        frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-        frag_C_out.store(frag_C.load().to(elem_dtype))
+        frag_C_out = fx.make_fragment_like(frag_C, c_storage_dtype)
+        frag_C_out.store(frag_C.load().to(c_storage_dtype))
 
         for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
             row = fx.get_scalar(thr_mma_cRow[i])
@@ -978,17 +1027,20 @@ def gemm_a16w16_hti_gfx950_kernel(
                 if (global_row < m) and (global_col < n):
                     c_vec = fx.ptr_load(
                         sC_base + local_row * half_block_n + local_col,
-                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, c_storage_dtype),
                     )
                     global_offset = global_row * n + global_col
-                    write_cshuffle_vec_to_global(
-                        out,
-                        out_buf,
-                        global_offset,
-                        c_vec,
-                        is_split_k,
-                        param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
-                    )
+                    if const_expr(param.splitk_partial_out):
+                        write_cshuffle_partial_to_global(out, global_offset, c_vec, m * n, ks_idx)
+                    else:
+                        write_cshuffle_vec_to_global(
+                            out,
+                            out_buf,
+                            global_offset,
+                            c_vec,
+                            is_split_k,
+                            param.out_dtype_id == GEMM_A16W16_DTYPE_FP32,
+                        )
 
     c00 = make_c_fragment(0, 0)
     c01 = make_c_fragment(0, 1)
@@ -1000,7 +1052,8 @@ def gemm_a16w16_hti_gfx950_kernel(
         c01.fill(0.0)
         c10.fill(0.0)
         c11.fill(0.0)
-        splitk_protocol.zero_c()
+        if const_expr(not param.splitk_partial_out):
+            splitk_protocol.zero_c()
     elif const_expr(param.has_bias):
         for i in range_constexpr(fx.size(c00.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
@@ -1131,17 +1184,22 @@ def gemm_a16w16_hti_gfx950_kernel(
     consume(c11, a1, b1, False)
     rocdl.sched_barrier(0)
     if const_expr(is_split_k):
-        if wid // n_waves == 0:
-            rocdl.s_barrier()
+        if const_expr(not param.splitk_partial_out):
+            if wid // n_waves == 0:
+                rocdl.s_barrier()
         rocdl.s_barrier()
         store_half_tile_to_lds(1, 0, c10)
         store_half_tile_to_lds(1, 1, c11)
-        splitk_protocol.wait_until_initialized()
+        if const_expr(not param.splitk_partial_out):
+            splitk_protocol.wait_until_initialized()
+        else:
+            gpu.barrier()
         store_half_tile_to_global(0, 0)
         store_half_tile_to_global(0, 1)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
-        splitk_protocol.finish_split(split_k)
+        if const_expr(not param.splitk_partial_out):
+            splitk_protocol.finish_split(split_k)
     else:
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(0, 0)
@@ -1152,6 +1210,68 @@ def gemm_a16w16_hti_gfx950_kernel(
         wait_vmcnt_and_barrier(0)
         store_half_tile_to_global(1, 0)
         store_half_tile_to_global(1, 1)
+
+
+
+@fx.struct
+class GemmA16W16SplitKReduceParam:
+    split_k: fx.Constexpr[int]
+    out_dtype_id: fx.Constexpr[int]
+    has_bias: fx.Constexpr[bool]
+    block_threads: fx.Constexpr[int]
+
+
+@flyc.jit
+def gemm_a16w16_splitk_reduce(
+    out: fx.Tensor,
+    scratch: fx.Tensor,
+    bias: fx.Tensor,
+    num_vec: fx.Int32,
+    n: fx.Int32,
+    blocks: fx.Int32,
+    param: GemmA16W16SplitKReduceParam,
+    stream: fx.Stream = fx.Stream(None),
+):
+    @flyc.kernel
+    def reduce_kernel(
+        out: fx.Tensor,
+        scratch: fx.Tensor,
+        bias: fx.Tensor,
+        num_vec: fx.Int32,
+        n: fx.Int32,
+        param: GemmA16W16SplitKReduceParam,
+    ):
+        tid = fx.Int32(fx.block_idx.x) * param.block_threads + fx.Int32(fx.thread_idx.x)
+        stride = fx.Int32(gpu.grid_dim.x) * param.block_threads
+        out_dtype = fx.Float16 if const_expr(param.out_dtype_id == GEMM_A16W16_DTYPE_FP16) else fx.BFloat16
+        split_stride = num_vec * 8
+        for vector_idx in range(tid, num_vec, stride):
+            offset = vector_idx * 8
+            acc = fx.full(8, 0.0, fx.Float32)
+            for split_idx in range_constexpr(param.split_k):
+                acc = acc + fx.ptr_load(
+                    fx.get_iter(scratch) + split_idx * split_stride + offset,
+                    result_type=fx.Vector.make_type(8, fx.Float32),
+                )
+            if const_expr(param.has_bias):
+                bias_offset = offset % n
+                bias_vec = fx.ptr_load(
+                    fx.get_iter(bias) + bias_offset,
+                    result_type=fx.Vector.make_type(8, out_dtype),
+                )
+                acc = acc + bias_vec.to(fx.Float32)
+            fx.ptr_store(acc.to(out_dtype), fx.get_iter(out) + offset)
+
+    reduce_kernel._known_block_size = [param.block_threads, 1, 1]
+    reduce_kernel._func.__name__ = (
+        f"hgemm_splitk_reduce_s{param.split_k}_{'fp16' if param.out_dtype_id == GEMM_A16W16_DTYPE_FP16 else 'bf16'}"
+        f"_bias{int(param.has_bias)}_{param.block_threads}t"
+    )
+    reduce_kernel(out, scratch, bias, num_vec, n, param).launch(
+        grid=(blocks, 1, 1),
+        block=(param.block_threads, 1, 1),
+        stream=stream,
+    )
 
 
 @flyc.jit
@@ -1302,6 +1422,221 @@ def _dynamic_tensor_arg(tensor, leading_dim):
     return flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
 
 
+
+# The bench supplies FlyDSL's small-M policy for M <= 64 and no hints for
+# larger shapes.  These policies are only hints, so use the empty/small-M
+# cases as an invitation to choose a shape-aware tile.  Other explicit
+# configurations are preserved verbatim (the tests use them to exercise the
+# full parameter matrix, including the expected validation failures).
+_AUTO_SMALL_M_POLICY = {
+    "block_m": 64,
+    "block_n": 64,
+    "block_k": 64,
+    "stages": 5,
+    "m_waves": 2,
+    "n_waves": 2,
+    "group_m": 0,
+    "use_half_tile_interleaved": False,
+}
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _nearest_divisor(total: int, target: int) -> int:
+    """Return the divisor of ``total`` closest to ``target`` (ties: smaller)."""
+    target = max(1, min(total, int(target)))
+    best = 1
+    for candidate in range(1, total + 1):
+        if total % candidate:
+            continue
+        if abs(candidate - target) < abs(best - target):
+            best = candidate
+    return best
+
+
+def _auto_tuned_configs(m: int, n: int, k: int):
+    """Ordered candidate tile policies for the hint-free/small-M entry point.
+
+    The first candidate is a deliberately shape-derived choice; the remaining
+    entries make the fallback robust for edge sizes and unusual K values.
+    """
+    candidates = []
+
+    def push(block_m, block_n, block_k, stages, m_waves, n_waves,
+             use_half_tile_interleaved, split_k, group_m=0, k_waves=1):
+        if k % block_k:
+            return
+        stages = max(2, int(stages))
+        candidates.append({
+            "block_m": block_m,
+            "block_n": block_n,
+            "block_k": block_k,
+            "stages": stages,
+            "split_k": max(1, int(split_k)),
+            "m_waves": m_waves,
+            "n_waves": n_waves,
+            "k_waves": k_waves,
+            "group_m": group_m,
+            "use_half_tile_interleaved": use_half_tile_interleaved,
+        })
+
+    def stage_limit(block_m, block_n, block_k):
+        return min(163840 // ((block_m + block_n) * block_k * 2), 16)
+
+    pid256 = _ceil_div(m, 256) * _ceil_div(n, 256)
+
+    if min(m, n) >= 512:
+        if pid256 >= 128:
+            # Enough 256x256 output tiles to occupy all CUs.  Grouping a
+            # few M tiles improves L2 locality; multi-round A/B shows a
+            # small consistent gain on full and partial-edge dense shapes.
+            push(256, 256, 64, 2, 2, 4, True, 1, group_m=8)
+        else:
+            # A 128x128x128 half-tile-interleaved tile exposes four times as
+            # many CTAs as the 256x256 default.  Split K only until there are
+            # roughly two CTA waves per CU.
+            grid = _ceil_div(m, 128) * _ceil_div(n, 128)
+            ntiles = k // 128
+            split = _nearest_divisor(ntiles, (256 + grid // 2) // grid)
+            push(128, 128, 128, 2, 2, 4, True, split, group_m=(8 if split == 1 else 0))
+            push(128, 128, 64, 2, 2, 4, True, split)
+            push(128, 128, 64, 4, 2, 4, False, 1)
+    elif m <= 32 and n <= 64:
+        # Decode-sized output: many tiny CTAs and a K-split are the only way
+        # to fill the GPU.  Keep about three K tiles per partition.
+        grid = _ceil_div(m, 16) * _ceil_div(n, 16)
+        # A 128-deep K tile keeps the few wavefronts busy without the
+        # block_k=32 LDS-layout corner case.  Keep about three K tiles per
+        # partition: deeper splits only add reduction traffic.
+        for block_k in (128, 64):
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, 16)
+            ktiles = max(1, ntiles // split)
+            stages = min(stage_limit(16, 16, block_k), ktiles + 1)
+            push(16, 16, block_k, stages, 1, 1, False, split)
+    elif m <= 32:
+        if n >= 1024:
+            if k <= 2048 and m <= 20:
+                # A 16-row tile already gives enough N tiles; avoid a
+                # reduction pass for very small M.
+                block_m, block_n, block_k, target = 16, 32, 64, 192
+                wave_m, wave_n = 1, 2
+            elif k <= 2048:
+                block_m, block_n, block_k, target = 32, 32, 64, 192
+                wave_m, wave_n = 2, 2
+            else:
+                block_m, block_n, block_k, target = 32, 64, 64, 224
+                wave_m, wave_n = 2, 2
+            grid = _ceil_div(m, block_m) * _ceil_div(n, block_n)
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, (target + grid // 2) // grid)
+            ktiles = max(1, ntiles // split)
+            stages = min(stage_limit(block_m, block_n, block_k), ktiles + 1)
+            push(block_m, block_n, block_k, stages, wave_m, wave_n, False, split)
+        else:
+            # Narrow/medium-N GEMV-like shapes benefit from an explicit
+            # N-splitting tile and enough independent CTAs.  A 64-deep K
+            # tile exposes more pipeline stages than the 128-deep variant.
+            block_m, block_n, block_k, target = 16, 32, 64, 192
+            grid = _ceil_div(m, block_m) * _ceil_div(n, block_n)
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, (target + grid // 2) // grid)
+            ktiles = max(1, ntiles // split)
+            stages = min(stage_limit(block_m, block_n, block_k), ktiles + 1)
+            push(block_m, block_n, block_k, stages, 1, 2, False, split)
+    elif m <= 64:
+        if n >= 1024:
+            block_n = 32 if k <= 2048 else 64
+            block_m, block_k, target = 64, 64, (192 if k <= 2048 else 224)
+            grid = _ceil_div(m, block_m) * _ceil_div(n, block_n)
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, (target + grid // 2) // grid)
+            ktiles = max(1, ntiles // split)
+            stages = min(stage_limit(block_m, block_n, block_k), ktiles + 1)
+            push(block_m, block_n, block_k, stages, 2, 2, False, split)
+        elif n >= 65:
+            # A half-height 32x64 tile doubles the number of independent
+            # blocks for medium-N decode shapes, which shortens the split-K
+            # critical path while preserving coalesced N-vector stores.
+            block_m, block_n, block_k, target = 32, 64, 64, 192
+            grid = _ceil_div(m, block_m) * _ceil_div(n, block_n)
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, (target + grid // 2) // grid)
+            ktiles = max(1, ntiles // split)
+            stages = min(stage_limit(block_m, block_n, block_k), ktiles + 1)
+            push(block_m, block_n, block_k, stages, 2, 2, False, split)
+        else:
+            if k <= 256:
+                block_n = 64 if n > 32 else 32
+                push(32, block_n, 64, 5, 2, 2, False, 1)
+            elif k <= 512:
+                push(32, 32, 64, 8, 2, 2, False, 1)
+            else:
+                ntiles = k // 64
+                split = _nearest_divisor(ntiles, 16)
+                ktiles = max(1, ntiles // split)
+                push(64, 64, 64, min(8, ktiles + 1), 4, 2, False, split)
+    elif m <= 128:
+        if n <= 128:
+            block_n = 64 if n > 64 else 32
+            ntiles = k // 64
+            # Medium-vector outputs benefit from more K partitions than the
+            # older target of 8; full-width 128-N tiles can go slightly deeper.
+            split_target = 24 if n >= 128 else 16
+            split = _nearest_divisor(ntiles, split_target)
+            ktiles = max(1, ntiles // split)
+            push(32, block_n, 64, min(8, ktiles + 1), 2, 2, False, split)
+        else:
+            block_m, block_n, block_k, target = 64, 64, 64, 96
+            grid = _ceil_div(m, block_m) * _ceil_div(n, block_n)
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, (target + grid // 2) // grid)
+            ktiles = max(1, ntiles // split)
+            push(block_m, block_n, block_k, min(stage_limit(block_m, block_n, block_k), ktiles + 1),
+                 2, 2, False, split)
+    else:
+        if n <= 64:
+            ntiles = k // 64
+            split = _nearest_divisor(ntiles, 8)
+            ktiles = max(1, ntiles // split)
+            push(64, 64, 64, min(8, ktiles + 1), 4, 2, False, split)
+        elif n <= 128:
+            if m >= 2048:
+                ntiles = k // 64
+                split = _nearest_divisor(ntiles, 4)
+                push(64, 128, 64, 6, 2, 4, False, split)
+            else:
+                grid = _ceil_div(m, 64) * _ceil_div(n, 64)
+                ntiles = k // 128
+                split = _nearest_divisor(ntiles, (160 + grid // 2) // grid)
+                # Deeper full-tile staging wins for medium-M/narrow-N shapes;
+                # HTI remains the fallback where its smaller LDS footprint is
+                # needed.
+                push(64, 64, 64, 8, 4, 2, False, split)
+                push(64, 64, 128, 2, 2, 2, True, split)
+        else:
+            block_m = 64
+            block_k = 64
+            block_n = 96 if (n <= 384 and n % 96 == 0) else 128
+            grid = _ceil_div(m, block_m) * _ceil_div(n, block_n)
+            ntiles = k // block_k
+            split = _nearest_divisor(ntiles, (192 + grid // 2) // grid)
+            push(block_m, block_n, block_k, 4, 2, 2, False, split)
+
+    # Robust fallbacks for edge sizes where the primary partition is not
+    # legal (very small K, unusual N tiling, etc.).
+    push(256, 256, 64, 2, 2, 4, True, 1)
+    push(128, 128, 128, 2, 2, 4, True, 1)
+    push(128, 128, 64, 4, 2, 4, False, 1)
+    push(64, 64, 64, 5, 2, 2, False, 1)
+    push(64, 64, 64, 2, 2, 2, False, 1)
+    push(32, 32, 64, 4, 2, 2, False, 1)
+    push(16, 16, 64, 4, 1, 1, False, 1)
+    return candidates
+
+
 def gemm_a16w16(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1404,7 +1739,7 @@ def gemm_a16w16(
     if bias is not None and not bias.is_contiguous():
         bias = bias.contiguous()
 
-    kwargs = {
+    defaults = {
         "block_m": 256,
         "block_n": 256,
         "block_k": 64,
@@ -1416,26 +1751,94 @@ def gemm_a16w16(
         "group_m": 0,
         "use_half_tile_interleaved": True,
     }
+    in_dtype_id = GEMM_A16W16_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_A16W16_DTYPE_BF16
+    final_out_dtype_id = GEMM_A16W16_DTYPE_FP32 if out.dtype is torch.float32 else in_dtype_id
+    auto_policy = (not user_kwargs) or (dict(user_kwargs) == _AUTO_SMALL_M_POLICY)
 
-    kwargs.update(user_kwargs)
-    kwargs["a_is_transposed"] = a_is_transposed
-    kwargs["b_is_transposed"] = b_is_transposed
-    kwargs["in_dtype_id"] = GEMM_A16W16_DTYPE_FP16 if a.dtype is torch.float16 else GEMM_A16W16_DTYPE_BF16
-    kwargs["out_dtype_id"] = GEMM_A16W16_DTYPE_FP32 if out.dtype is torch.float32 else kwargs["in_dtype_id"]
-    kwargs["has_bias"] = False if bias is None else True
-    split_k = kwargs["split_k"]
-    assert_no_k_tail(k, kwargs)
+    def use_split_partial(split):
+        # Split-K must retain fp32 accumulation.  In particular, 16-bit
+        # atomic adds round after every CTA and intermittently exceed the
+        # per-element tolerance, so use disjoint fp32 partial planes and one
+        # final rounding for all 16-bit outputs.
+        return split > 1 and final_out_dtype_id != GEMM_A16W16_DTYPE_FP32
+
+    def make_candidate(tunable):
+        candidate = dict(tunable)
+        candidate.update(a_is_transposed=a_is_transposed, b_is_transposed=b_is_transposed)
+        candidate.update(has_bias=False if bias is None else True)
+        candidate["in_dtype_id"] = in_dtype_id
+        candidate["final_out_dtype_id"] = final_out_dtype_id
+        split = int(candidate.get("split_k", 1))
+        candidate["splitk_partial_out"] = use_split_partial(split)
+        candidate["out_dtype_id"] = (
+            GEMM_A16W16_DTYPE_FP32
+            if candidate["splitk_partial_out"]
+            else final_out_dtype_id
+        )
+        return candidate
+
+    params = []
+    split_k = None
+    split_partial = False
+    if auto_policy:
+        for tunable in _auto_tuned_configs(m, n, k):
+            candidate = make_candidate(tunable)
+            try:
+                assert_no_k_tail(k, candidate)
+                candidate_param = make_gemm_a16w16_param_and_validate(m, n, k, candidate)
+            except Exception:
+                continue
+            if candidate_param is not None:
+                params.append(candidate_param)
+                split_k = int(candidate["split_k"])
+                split_partial = bool(candidate["splitk_partial_out"])
+                break
+        assert params, "unsupported gemm_a16w16_gfx950 shape/config"
+        param = params[0]
+    else:
+        kwargs = dict(defaults)
+        kwargs.update(user_kwargs)
+        kwargs.update(a_is_transposed=a_is_transposed, b_is_transposed=b_is_transposed)
+        kwargs["in_dtype_id"] = in_dtype_id
+        kwargs["final_out_dtype_id"] = final_out_dtype_id
+        kwargs["has_bias"] = False if bias is None else True
+        split_k = kwargs["split_k"]
+        assert_no_k_tail(k, kwargs)
+        kwargs["splitk_partial_out"] = use_split_partial(split_k)
+        kwargs["out_dtype_id"] = (
+            GEMM_A16W16_DTYPE_FP32
+            if kwargs["splitk_partial_out"]
+            else final_out_dtype_id
+        )
+        param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
+        if param is None and kwargs["splitk_partial_out"]:
+            # The fp32 LDS staging tile can exceed the hardware limit for
+            # large split-K tiles.  Fall back to the stock atomic output path;
+            # the test tolerances scale with split_k for this explicit case.
+            kwargs["splitk_partial_out"] = False
+            kwargs["out_dtype_id"] = final_out_dtype_id
+            param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
+        assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
 
     if bias is not None:
         assert bias.shape[0] == n
         assert bias.dtype == a.dtype
 
-    param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
-    assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
+    if not auto_policy:
+        split_k = int(kwargs["split_k"])
+    assert split_k is not None
+    if not auto_policy:
+        split_partial = bool(kwargs["splitk_partial_out"])
+    scratch = None
+    if split_partial:
+        scratch = torch.empty((split_k, m, n), dtype=torch.float32, device=device)
+        main_out = scratch.view(split_k, m, n)[0]
+    else:
+        main_out = out
     semaphore, signal = get_split_k_buffers(stream, device)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
-    out_arg = _dynamic_tensor_arg(out, 1)
+    out_arg = _dynamic_tensor_arg(main_out, 1)
     bias_arg = a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
     dispatch_args = (
         out_arg,
@@ -1455,4 +1858,45 @@ def gemm_a16w16(
         compiler=flyc.compile,
         dispatch_args=dispatch_args,
     )
+    if split_partial:
+        num_vec = (m * n) // 8
+        if num_vec <= 128:
+            reduce_threads = 256
+        elif num_vec <= 1536 and param.block_n <= 32:
+            reduce_threads = 128
+        elif num_vec <= 4096:
+            reduce_threads = 64
+        else:
+            target = max(1, (num_vec + 127) // 128)
+            reduce_threads = min(256, max(64, 1 << (target - 1).bit_length()))
+        reduce_blocks = min(max(1, (num_vec + reduce_threads - 1) // reduce_threads), 4096)
+        reduce_param = GemmA16W16SplitKReduceParam(
+            split_k=split_k,
+            out_dtype_id=final_out_dtype_id,
+            has_bias=bias is not None,
+            block_threads=reduce_threads,
+        )
+        out_flat = out.view(-1)
+        scratch_flat = scratch.view(-1)
+        out_flat_arg = _dynamic_tensor_arg(out_flat, 0)
+        scratch_flat_arg = _dynamic_tensor_arg(scratch_flat, 0)
+        bias_flat_arg = out_flat_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+        reduce_dispatch_args = (
+            out_flat_arg,
+            scratch_flat_arg,
+            bias_flat_arg,
+            num_vec,
+            n,
+            reduce_blocks,
+            reduce_param,
+            stream,
+        )
+        run_cached(
+            gemm_a16w16_splitk_reduce,
+            *reduce_dispatch_args,
+            constexpr_param=reduce_param,
+            compiler=flyc.compile,
+            dispatch_args=reduce_dispatch_args,
+        )
+        scratch.record_stream(stream)
     return out

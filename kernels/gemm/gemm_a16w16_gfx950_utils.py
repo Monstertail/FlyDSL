@@ -261,6 +261,8 @@ class SplitKProtocol:
 
     @flyc.jit
     def finish_split(self, split_k):
+        # Per-tile semaphore only orders the zero-fill phase; global atomics
+        # provide the split-K reduction on this compatibility path.
         gpu.barrier()
         if self.tid == 0:
             arrive_idx = fx.atomic_add(self.semaphore_ptr, fx.Int32(1), syncscope="agent")
