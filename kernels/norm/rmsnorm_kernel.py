@@ -64,6 +64,9 @@ WIDE_ROW_BLOCK_THREADS = 512
 LLC_BYTES = 256 * 1024 * 1024
 NT_MIN_WORKING_SET = LLC_BYTES * 9 // 8
 
+# Fused add + quant moves 2+2 bytes per element in and 2+1 out.
+FUSED_ADD_QUANT_BYTES_PER_ELEM = 7
+
 
 def default_block_threads(N: int, arch=None) -> int:
     """Wide rows hold fewer resident vectors per thread at 512 than at 256."""
@@ -1547,19 +1550,412 @@ def _build_fused_add_rmsnorm_quant_module(
         return launch_fused_add_rmsnorm_dynamicquant
 
 
+def _fused_add_quant_geometry(
+    dtype_str: str,
+    N: int,
+    threads_per_row: int | None = None,
+    groups: int | None = None,
+) -> tuple[int, int, int, int, int]:
+    """(threads_per_row, groups, threads, vec_tiles, iters) for the fused add + quant kernel.
+
+    One *group* of ``threads_per_row`` lanes owns one row and keeps the whole row in
+    registers. ``threads_per_row`` rounds up to a power of two, so a row that is a whole
+    number of waves instead fills its block exactly: no lane is idle in the last pass,
+    which measures 3-8% faster on the row-per-block shapes. Rows wider than ten waves
+    get half a row per lane when both passes then fill exactly.
+
+    Narrow rows pack several groups into one block: a block of 1024 threads costs the
+    same to dispatch as a block of 64, and a kernel whose grid fits in the smallest
+    dispatch step is measurably faster than the same work spread over more blocks. From
+    two waves per row up, packing rows only makes each block longer and measures slower
+    at every row count, so those keep one row per block.
+    """
+    elem_bits = 32 if dtype_str == "f32" else 16
+    vec = 128 // elem_bits
+    vec_tiles = N // vec
+    if threads_per_row is None:
+        threads_per_row = 8
+        while threads_per_row < vec_tiles and threads_per_row < 512:
+            threads_per_row *= 2
+        # A row that is a whole number of waves (up to ten) should fill its block
+        # exactly instead of rounding up to a power of two: the last iteration then
+        # has no idle lanes and the row needs one pass rather than two.
+        if 0 < vec_tiles <= 640 and vec_tiles % WARP_SIZE == 0:
+            threads_per_row = vec_tiles
+        elif (
+            threads_per_row < vec_tiles
+            and vec_tiles % 2 == 0
+            and (vec_tiles // 2) % WARP_SIZE == 0
+            and vec_tiles // 2 <= 512
+        ):
+            # Same argument one step out: a row of 14 or 12 waves is not worth
+            # rounding up to 512 lanes only to leave a quarter of them idle in the
+            # second pass, so give each lane half a row and keep both passes full.
+            threads_per_row = vec_tiles // 2
+    if groups is None:
+        # Narrow rows pack several groups into one block: a block of 1024 threads
+        # costs the same to dispatch as a block of 64, and a kernel whose grid fits
+        # in the smallest dispatch step is measurably faster than the same work
+        # spread over more blocks. From two waves per row up, packing rows into one
+        # block only makes each block longer and measures slower at every row count.
+        target = 1024 if vec_tiles <= 64 else 512
+        groups = max(1, target // threads_per_row) if threads_per_row <= WARP_SIZE else 1
+    threads = threads_per_row * groups
+    iters = (vec_tiles + threads_per_row - 1) // threads_per_row
+    return threads_per_row, groups, threads, vec_tiles, iters
+
+
+def _tile_index(idx, limit: int, full: bool):
+    """The tile index itself when the tile is complete, else one valid for idle lanes."""
+    return idx if full else (idx < limit).select(idx, 0)
+
+
+def _bf16x2_unpack(words, vec: int):
+    """A ``vector<vec x bf16>`` in ``vec/2`` words as ``vec`` fp32 lanes.
+
+    Rounding ``x + residual`` to bf16 and reading it back as fp32 is what the
+    max/quantize pass needs. Reading it back through ``fpext`` costs two
+    instructions per lane (round again, then shift); the value that was just
+    packed is already in a register, so taking it apart with one shift or mask
+    per lane halves that, and the packed word is shared with the residual store.
+    """
+    out = []
+    high_half_mask = fx.Uint32(0xFFFF0000)
+    for k in range_constexpr(vec // 2):
+        word = words[k]
+        out.append((word << 16).bitcast(fx.Float32))
+        out.append((word & high_half_mask).bitcast(fx.Float32))
+    return fx.Vector.from_elements(out, fx.Float32)
+
+
+def _make_fused_add_quant_launch(
+    N: int,
+    dtype_str: str,
+    *,
+    quant_dtype_str: str,
+    eps: float,
+    threads_per_row: int,
+    groups: int,
+    load_cache: int,
+    store_cache: int,
+    bit_unpack: bool = True,
+):
+    """Single-pass fused residual add + RMSNorm + per-row int8 quantization.
+
+    A group of ``threads_per_row`` lanes owns one row: its ``x``, ``residual`` and
+    ``gamma`` vectors are loaded up front, ``a = x + residual`` is rounded once and
+    kept in registers, and both row statistics (``sum(a^2)`` and ``max|a * gamma|``)
+    come out of one reduction. Since ``y = a * rsqrt(mean(a^2) + eps) * gamma`` is
+    scaled by the same ``rrms`` everywhere, ``max|y| = rrms * max|a * gamma|`` and the
+    quantized output is ``trunc(a * gamma * 127 / max|a * gamma|)`` -- the normalization
+    cancels, so the int8 pass never waits on a second reduction of ``y``.
+    """
+    arch = get_rocm_arch()
+    USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
+    BIT_UNPACK = bit_unpack and dtype_str == "bf16" and USE_HW_CVT_PK_BF16_F32
+
+    quant_dtype = _quant_dtype_to_elem_type(quant_dtype_str)
+    quant_dtype_max = _quant_dtype_max(quant_dtype_str)
+    elem_bits = 32 if dtype_str == "f32" else 16
+    VEC = 128 // elem_bits
+    TP, GROUPS = threads_per_row, groups
+    _, _, THREADS, VEC_TILES, ITERS = _fused_add_quant_geometry(dtype_str, N, TP, GROUPS)
+    TAIL = N - VEC_TILES * VEC
+    TAIL_BASE = VEC_TILES * VEC
+    NUM_WARPS = THREADS // WARP_SIZE
+    WARPS_PER_GROUP = max(TP // WARP_SIZE, 1)
+    SUB_WARP = TP < WARP_SIZE
+    SHARED_SLOTS = max(NUM_WARPS, 1)
+    _kernel_kwargs = {} if THREADS <= 256 else {"known_block_size": [THREADS, 1, 1]}
+
+    @fx.struct
+    class SharedStats:
+        sums: fx.Array[fx.Float32, SHARED_SLOTS, 16]
+        maxs: fx.Array[fx.Float32, SHARED_SLOTS, 16]
+
+    def _added_f32(added_e):
+        """``a = x + residual`` rounded to ``dtype_str``, as fp32 lanes."""
+        if const_expr(dtype_str == "f32"):
+            return added_e
+        if const_expr(BIT_UNPACK):
+            return _bf16x2_unpack(added_e.bitcast(fx.Uint32), VEC)
+        return added_e.to(fx.Float32)
+
+    def _tree_sum(vals):
+        while len(vals) > 1:
+            nxt = [vals[i] + vals[i + 1] for i in range(0, len(vals) - 1, 2)]
+            if len(vals) % 2:
+                nxt.append(vals[-1])
+            vals = nxt
+        return vals[0]
+
+    def _tree_max(vals):
+        while len(vals) > 1:
+            nxt = [fx.max(vals[i], vals[i + 1]) for i in range(0, len(vals) - 1, 2)]
+            if len(vals) % 2:
+                nxt.append(vals[-1])
+            vals = nxt
+        return vals[0]
+
+    @flyc.kernel(**_kernel_kwargs)
+    def fused_add_rmsnorm_dynamicquant_kernel(
+        Input: fx.Tensor,
+        ResidualIn: fx.Tensor,
+        Gamma: fx.Tensor,
+        Output: fx.Tensor,
+        ResidualOut: fx.Tensor,
+        YScale: fx.Tensor,
+        m_in: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        elem_dtype = dtype_to_elem_type(dtype_str)
+        fm_fast = arith.FastMathFlags.fast
+        eps_c = eps
+        n_float = float(N)
+        c_zero_f = fx.Float32(0.0)
+        c_one_f = fx.Float32(1.0)
+        c_dtype_max = fx.Float32(quant_dtype_max)
+
+        grp = tid // TP
+        gl = tid % TP
+        row = bid * GROUPS + grp
+        if const_expr(GROUPS > 1):
+            row_valid = row < m_in
+            row = row_valid.select(row, 0)
+
+        lds = fx.SharedAllocator().allocate(SharedStats).peek()
+
+        Input_buf = fx.rocdl.make_buffer_tensor(Input)
+        ResidualIn_buf = fx.rocdl.make_buffer_tensor(ResidualIn)
+        Gamma_buf = fx.rocdl.make_buffer_tensor(Gamma)
+        Output_buf = fx.rocdl.make_buffer_tensor(Output)
+        ResidualOut_buf = fx.rocdl.make_buffer_tensor(ResidualOut)
+        YScale_buf = fx.rocdl.make_buffer_tensor(YScale)
+
+        row_in = fx.slice(Input_buf, (row, None))
+        row_residual_in = fx.slice(ResidualIn_buf, (row, None))
+        row_out = fx.slice(Output_buf, (row, None))
+        row_residual_out = fx.slice(ResidualOut_buf, (row, None))
+
+        in_div = fx.logical_divide(row_in, fx.make_layout(VEC, 1))
+        residual_in_div = fx.logical_divide(row_residual_in, fx.make_layout(VEC, 1))
+        residual_out_div = fx.logical_divide(row_residual_out, fx.make_layout(VEC, 1))
+        out_div = fx.logical_divide(row_out, fx.make_layout(VEC, 1))
+        gamma_div = fx.logical_divide(Gamma_buf, fx.make_layout(VEC, 1))
+
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(load_cache), elem_bits)
+        copy_atom_st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(store_cache), elem_bits)
+        copy_atom_q = fx.make_copy_atom(
+            fx.rocdl.BufferCopy64b(store_cache) if VEC > 4 else fx.rocdl.BufferCopy32b(store_cache), 8
+        )
+
+        abs_mask = fx.full(VEC, 0x7FFFFFFF, fx.Uint32)
+
+        # Every lane loads first: the row's three operand vectors are independent, so
+        # one round trip covers them and the reduction sees them all at once.
+        x_all = []
+        residual_all = []
+        gamma_all = []
+        for tile_i in range_constexpr(ITERS):
+            idx_safe = _tile_index(gl + tile_i * TP, VEC_TILES, (tile_i + 1) * TP <= VEC_TILES)
+            x_all.append(_load_vec(copy_atom, VEC, elem_dtype, in_div, idx_safe))
+            residual_all.append(_load_vec(copy_atom, VEC, elem_dtype, residual_in_div, idx_safe))
+            gamma_all.append(_load_vec(copy_atom, VEC, elem_dtype, gamma_div, idx_safe))
+
+        thread_sumsq = c_zero_f
+        thread_row_max = c_zero_f
+        ag_local = []
+
+        for tile_i in range_constexpr(ITERS):
+            idx = gl + tile_i * TP
+            is_full = (tile_i + 1) * TP <= VEC_TILES
+            x = x_all[tile_i].to(fx.Float32)
+            residual = residual_all[tile_i].to(fx.Float32)
+            added_e = _to_elem_vec(dtype_str, elem_dtype, USE_HW_CVT_PK_BF16_F32, x + residual)
+            if const_expr(is_full):
+                _store_vec(copy_atom_st, VEC, elem_dtype, added_e, residual_out_div, idx)
+            else:
+                if idx < VEC_TILES:
+                    _store_vec(copy_atom_st, VEC, elem_dtype, added_e, residual_out_div, idx)
+            added = _added_f32(added_e)
+            ag = added * gamma_all[tile_i].to(fx.Float32)
+            ag_local.append(ag)
+            sumsq = (added * added).reduce(ReductionOp.ADD, fastmath=fm_fast)
+            ag_abs = (ag.bitcast(fx.Uint32) & abs_mask).bitcast(fx.Float32)
+            tile_max = ag_abs.reduce(ReductionOp.MAX)
+            if const_expr(is_full):
+                thread_sumsq = thread_sumsq + sumsq
+                thread_row_max = fx.max(thread_row_max, tile_max)
+            else:
+                is_valid = idx < VEC_TILES
+                thread_sumsq = thread_sumsq + is_valid.select(sumsq, c_zero_f)
+                thread_row_max = fx.max(thread_row_max, is_valid.select(tile_max, c_zero_f))
+
+        ag_tail = c_zero_f
+        if const_expr(TAIL > 0):
+            tail_idx = TAIL_BASE + gl
+            tail_valid = gl < TAIL
+            tail_safe = tail_valid.select(tail_idx, 0)
+            x_t = row_in[tail_safe]
+            residual_t = row_residual_in[tail_safe]
+            x_t = x_t if dtype_str == "f32" else x_t.to(fx.Float32)
+            residual_t = residual_t if dtype_str == "f32" else residual_t.to(fx.Float32)
+            added_t = _to_elem_scalar(dtype_str, elem_dtype, x_t + residual_t)
+            gamma_t = Gamma_buf[tail_safe]
+            gamma_t = gamma_t if dtype_str == "f32" else gamma_t.to(fx.Float32)
+            if tail_valid:
+                row_residual_out[tail_idx] = added_t
+            added_tf = added_t if dtype_str == "f32" else added_t.to(fx.Float32)
+            ag_tail = tail_valid.select(added_tf * gamma_t, c_zero_f)
+            thread_sumsq = thread_sumsq + tail_valid.select(added_tf * added_tf, c_zero_f)
+            ag_abs_t = (ag_tail.bitcast(fx.Uint32) & 0x7FFFFFFF).bitcast(fx.Float32)
+            thread_row_max = fx.max(thread_row_max, ag_abs_t)
+
+        if const_expr(SUB_WARP):
+            with fx.fastmath(fm_fast):
+                total_sum = fx.coop.warp_reduce(thread_sumsq, fx.ReductionOp.ADD, width=TP)
+            total_max = fx.coop.warp_reduce(thread_row_max, fx.ReductionOp.MAX, width=TP)
+        else:
+            with fx.fastmath(fm_fast):
+                sum_warp = fx.coop.warp_reduce(thread_sumsq, fx.ReductionOp.ADD)
+            max_warp = fx.coop.warp_reduce(thread_row_max, fx.ReductionOp.MAX)
+            if const_expr(WARPS_PER_GROUP == 1):
+                total_sum = sum_warp
+                total_max = max_warp
+            else:
+                warp_id = tid // WARP_SIZE
+                if gl % WARP_SIZE == 0:
+                    lds.sums[warp_id] = sum_warp
+                    lds.maxs[warp_id] = max_warp
+                gpu.barrier()
+                base = grp * WARPS_PER_GROUP
+                total_sum = _tree_sum([lds.sums[base + i] for i in range_constexpr(WARPS_PER_GROUP)])
+                total_max = _tree_max([lds.maxs[base + i] for i in range_constexpr(WARPS_PER_GROUP)])
+
+        with fx.fastmath(fm_fast):
+            mean_sq = total_sum / n_float
+            rrms = fmath.rsqrt(mean_sq + eps_c, fastmath=fm_fast)
+            row_max = total_max * rrms
+            scale = row_max / c_dtype_max
+            final_scale = (scale == c_zero_f).select(c_one_f, scale)
+            # y / yscale == a * gamma * 127 / max|a * gamma|: the rrms factor cancels.
+            inv_scale = (total_max == c_zero_f).select(c_zero_f, c_dtype_max / total_max)
+
+        if gl == 0:
+            if const_expr(GROUPS > 1):
+                if row_valid:
+                    YScale_buf[row] = final_scale
+            else:
+                YScale_buf[row] = final_scale
+
+        for tile_i in range_constexpr(ITERS):
+            idx = gl + tile_i * TP
+            q_i8 = (ag_local[tile_i] * inv_scale).to(quant_dtype)
+            if const_expr((tile_i + 1) * TP <= VEC_TILES):
+                _store_vec(copy_atom_q, VEC, quant_dtype, q_i8, out_div, idx)
+            else:
+                if idx < VEC_TILES:
+                    _store_vec(copy_atom_q, VEC, quant_dtype, q_i8, out_div, idx)
+
+        if const_expr(TAIL > 0):
+            if gl < TAIL:
+                row_out[TAIL_BASE + gl] = (ag_tail * inv_scale).to(quant_dtype)
+
+    @flyc.jit
+    def launch_fused_add_rmsnorm_dynamicquant(
+        Input: fx.Tensor,
+        ResidualIn: fx.Tensor,
+        Gamma: fx.Tensor,
+        Output: fx.Tensor,
+        ResidualOut: fx.Tensor,
+        YScale: fx.Tensor,
+        m_in: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        launcher = fused_add_rmsnorm_dynamicquant_kernel(Input, ResidualIn, Gamma, Output, ResidualOut, YScale, m_in)
+        launcher.launch(
+            grid=((fx.Index(m_in) + (GROUPS - 1)) // GROUPS, 1, 1),
+            block=(THREADS, 1, 1),
+            stream=stream,
+        )
+
+    return launch_fused_add_rmsnorm_dynamicquant
+
+
 def build_fused_add_rmsnorm_dynamicquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
     eps: float = EPS,
 ):
-    return _build_fused_add_rmsnorm_quant_module(
+    """Fused residual add + RMSNorm + per-row int8 dynamic quantization.
+
+    Both cache policies are compiled into one launcher and picked by the row count at
+    run time: a call whose operands fit the last-level cache keeps them, and only a
+    call that streams past it goes non-temporal. Below 1.125x the cache, streaming
+    throws away reuse the cache would have served.
+
+    Inside the cached branch the two outputs still go non-temporal for 16-bit rows: no
+    call reads them back, and keeping them out of L2 leaves the cache to the operands,
+    which measures a few percent faster on the row-per-block shapes. f32 rows move
+    eight bytes per element of operand instead of four and lose that few percent, so
+    they keep the default write policy.
+    """
+    threads_per_row, groups, _, _, _ = _fused_add_quant_geometry(dtype_str, N)
+    cached_store_cache = 2 if dtype_str in ("f16", "bf16") else 0
+    cached_launch = _make_fused_add_quant_launch(
         N,
         dtype_str,
-        is_smooth=False,
         quant_dtype_str=quant_dtype_str,
         eps=eps,
+        threads_per_row=threads_per_row,
+        groups=groups,
+        load_cache=0,
+        store_cache=cached_store_cache,
     )
+    streaming_launch = _make_fused_add_quant_launch(
+        N,
+        dtype_str,
+        quant_dtype_str=quant_dtype_str,
+        eps=eps,
+        threads_per_row=threads_per_row,
+        groups=groups,
+        load_cache=2,
+        store_cache=2,
+    )
+    nt_min_rows = max(NT_MIN_WORKING_SET // (N * FUSED_ADD_QUANT_BYTES_PER_ELEM), 0)
+
+    @flyc.jit
+    def launch_fused_add_rmsnorm_dynamicquant(
+        Input: fx.Tensor,
+        ResidualIn: fx.Tensor,
+        Gamma: fx.Tensor,
+        Output: fx.Tensor,
+        ResidualOut: fx.Tensor,
+        YScale: fx.Tensor,
+        m_in: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        _validate_norm_operand_dtypes(Input, dtype_str, ResidualIn=ResidualIn, Gamma=Gamma, ResidualOut=ResidualOut)
+
+        def launch_cached():
+            cached_launch(Input, ResidualIn, Gamma, Output, ResidualOut, YScale, m_in, stream)
+
+        def launch_streaming():
+            streaming_launch(Input, ResidualIn, Gamma, Output, ResidualOut, YScale, m_in, stream)
+
+        @flyc.jit
+        def dispatch():
+            if m_in > fx.Int32(nt_min_rows):
+                launch_streaming()
+            else:
+                launch_cached()
+
+        dispatch()
+
+    return launch_fused_add_rmsnorm_dynamicquant
 
 
 def build_fused_add_rmsnorm_smoothquant_module(
