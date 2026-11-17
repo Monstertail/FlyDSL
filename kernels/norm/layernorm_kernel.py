@@ -13,6 +13,7 @@ Two paths:
 """
 
 import flydsl.compiler as flyc
+from flydsl.compiler.jit_function import JitFunction
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
@@ -1198,19 +1199,301 @@ def _build_fused_add_layernorm_quant_module(
     return launch_fused_add_layernorm_dynamicquant
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fast per-row int8 dynamic-quantization path
+# ─────────────────────────────────────────────────────────────────────────────
+# One launch covers `ceil(M / rows)` row groups; inside a group each row is
+# owned by `lpr` consecutive lanes, so both row reductions (sum/sumsq, then
+# |y|max) are pure lane shuffles when `lpr <= 64` and a small LDS merge
+# otherwise. A row's `vec`-wide chunks stay in registers across the passes, so
+# the input is read from memory exactly once and gamma/beta are hoisted above
+# the first reduction.
+
+_FAST_LPR_CANDIDATES = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+_FAST_MAX_CHUNKS = 6
+_FAST_SHORT_GROUP = 128
+_FAST_THREADS = 256
+
+
+def _plan_dynamicquant(N: int, elem_bytes: int):
+    """Choose (lanes_per_row, threads, rows_per_cta, vec) from N alone."""
+    vec = 16 // elem_bytes
+    ngroups = N // vec
+    if ngroups <= _FAST_SHORT_GROUP:
+        # Short rows: spread each row over just enough lanes to keep ~16
+        # elements per lane, so one wave covers many rows and the row
+        # reductions stay inside a single wave.
+        want = max(1, min((ngroups * vec) // 16, ngroups))
+        lpr = 1
+        while lpr * 2 <= want:
+            lpr *= 2
+    else:
+        best = None
+        for cand in _FAST_LPR_CANDIDATES:
+            chunks = (ngroups + cand - 1) // cand if ngroups > 0 else 0
+            if chunks > _FAST_MAX_CHUNKS:
+                continue
+            key = (chunks * cand, abs(cand.bit_length() - 9))
+            if best is None or key < best[0]:
+                best = (key, cand)
+        lpr = best[1] if best is not None else _FAST_LPR_CANDIDATES[-1]
+    # One row per CTA once a row already spans several waves; otherwise pack
+    # several rows into the CTA so small rows still fill a wave.
+    threads = lpr if lpr >= 128 else max(_FAST_THREADS, lpr)
+    rows = max(1, threads // lpr)
+    threads = rows * lpr
+    return lpr, threads, rows, vec
+
+
+def _build_layernorm_dynamicquant(N: int, dtype_str: str, quant_dtype_str: str = "i8", eps: float = EPS):
+    quant_dtype = _quant_dtype_to_elem_type(quant_dtype_str)
+    quant_max = _quant_dtype_max(quant_dtype_str)
+    elem_bytes = 4 if dtype_str == "f32" else 2
+    lpr, threads, rows, vec = _plan_dynamicquant(N, elem_bytes)
+
+    ngroups = N // vec
+    tail = N - ngroups * vec
+    chunks = (ngroups + lpr - 1) // lpr
+    tail_iters = (tail + lpr - 1) // lpr
+    lanes = threads // 64
+    warps_per_row = max(1, lpr // 64)
+    use_lds = lpr > 64
+    # Wide rows (one row per CTA) can afford to pre-convert the affine
+    # parameters to fp32, which removes two conversions per element from both
+    # normalize passes. Short rows pack several rows into a CTA and are
+    # register-limited instead, so they keep the storage dtype.
+    affine_f32 = lpr >= 128 and chunks <= 4
+    elem_dtype = dtype_to_elem_type(dtype_str)
+    fm_fast = arith.FastMathFlags.fast
+    n_float = float(N)
+
+    if use_lds:
+
+        @fx.struct
+        class SharedStorage:
+            red: fx.Array[fx.Float32, 3 * lanes, 16]
+
+    def _load_chunk(copy_atom, div_tensor, idx):
+        frag = fx.make_rmem_tensor(vec, elem_dtype)
+        fx.copy(copy_atom, fx.slice(div_tensor, (None, idx)), frag)
+        return fx.memref_load_vec(frag)
+
+    def _store_chunk(copy_atom, val, div_tensor, idx):
+        frag = fx.make_rmem_tensor(vec, quant_dtype)
+        fx.memref_store_vec(val, frag)
+        fx.copy(copy_atom, frag, fx.slice(div_tensor, (None, idx)))
+
+    @flyc.kernel
+    def layernorm_dynamicquant_kernel(
+        Input: fx.Tensor,
+        Gamma: fx.Tensor,
+        Beta: fx.Tensor,
+        Output: fx.Tensor,
+        YScale: fx.Tensor,
+        m_in: fx.Int32,
+    ):
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+
+        c_zero = fx.Float32(0.0)
+        c_one = fx.Float32(1.0)
+        c_qmax = fx.Float32(quant_max)
+        abs_mask = full(vec, fx.Uint32(0x7FFFFFFF), fx.Uint32)
+
+        if const_expr(lpr > 1):
+            lane = tid % lpr
+            grp = tid // lpr
+        else:
+            lane = fx.Int32(0)
+            grp = tid
+        lane64 = tid % 64
+        wave = tid // 64
+
+        if const_expr(use_lds):
+            red = fx.SharedAllocator().allocate(SharedStorage).peek().red.ptr
+
+        row = bid * rows + grp
+        row_ok = row < m_in
+        row_safe = row_ok.select(row, 0)
+
+        Input_buf = fx.rocdl.make_buffer_tensor(Input)
+        Gamma_buf = fx.rocdl.make_buffer_tensor(Gamma)
+        Beta_buf = fx.rocdl.make_buffer_tensor(Beta)
+        Output_buf = fx.rocdl.make_buffer_tensor(Output)
+        YScale_buf = fx.rocdl.make_buffer_tensor(YScale)
+
+        in_row = fx.slice(Input_buf, (row_safe, None))
+        out_row = fx.slice(Output_buf, (row_safe, None))
+        in_div = fx.logical_divide(in_row, fx.make_layout(vec, 1))
+        gamma_div = fx.logical_divide(Gamma_buf, fx.make_layout(vec, 1))
+        beta_div = fx.logical_divide(Beta_buf, fx.make_layout(vec, 1))
+        out_div = fx.logical_divide(out_row, fx.make_layout(vec, 1))
+
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_bytes * 8)
+        copy_atom_q = fx.make_copy_atom(fx.rocdl.BufferCopy(vec * 8), 8)
+
+        def lane_reduce(value, op):
+            if const_expr(lpr == 1):
+                return value
+            return fx.coop.warp_reduce(value, op, width=lpr)
+
+        def row_reduce2(val0, val1):
+            """Row sum and sum-of-squares, broadcast to every lane of the row."""
+            if const_expr(not use_lds):
+                return lane_reduce(val0, ReductionOp.ADD), lane_reduce(val1, ReductionOp.ADD)
+            part0 = fx.coop.warp_reduce(val0, ReductionOp.ADD, width=64)
+            part1 = fx.coop.warp_reduce(val1, ReductionOp.ADD, width=64)
+            if lane64 == 0:
+                fx.ptr_store(part0, red + wave)
+                fx.ptr_store(part1, red + lanes + wave)
+            gpu.barrier()
+            base = grp * warps_per_row
+            acc0 = fx.ptr_load(red + base)
+            acc1 = fx.ptr_load(red + lanes + base)
+            for i in range_constexpr(1, warps_per_row):
+                acc0 = acc0 + fx.ptr_load(red + base + i)
+                acc1 = acc1 + fx.ptr_load(red + lanes + base + i)
+            return acc0, acc1
+
+        def row_reduce_max(val):
+            """Row maximum of |y|, broadcast to every lane of the row."""
+            if const_expr(not use_lds):
+                return lane_reduce(val, ReductionOp.MAX)
+            part = fx.coop.warp_reduce(val, ReductionOp.MAX, width=64)
+            if lane64 == 0:
+                fx.ptr_store(part, red + 2 * lanes + wave)
+            gpu.barrier()
+            base = grp * warps_per_row
+            acc = fx.ptr_load(red + 2 * lanes + base)
+            for i in range_constexpr(1, warps_per_row):
+                acc = fx.max(acc, fx.ptr_load(red + 2 * lanes + base + i))
+            return acc
+
+        # ── load the row chunks, then gamma/beta (hoisted above the reduction) ──
+        x_local = []
+        for chunk in range_constexpr(chunks):
+            idx = lane + chunk * lpr
+            x_local.append(_load_chunk(copy_atom, in_div, (idx < ngroups).select(idx, 0)))
+        # gamma/beta are kept in their storage dtype until used: hoisting the
+        # loads over the reduction hides their latency without doubling the live
+        # register footprint the way an fp32 pre-convert would.
+        g_local = []
+        b_local = []
+        for chunk in range_constexpr(chunks):
+            idx = lane + chunk * lpr
+            idx_safe = (idx < ngroups).select(idx, 0)
+            gv = _load_chunk(copy_atom, gamma_div, idx_safe)
+            bv = _load_chunk(copy_atom, beta_div, idx_safe)
+            if const_expr(affine_f32):
+                gv = gv.to(fx.Float32)
+                bv = bv.to(fx.Float32)
+            g_local.append(gv)
+            b_local.append(bv)
+
+        thread_sum = c_zero
+        thread_sumsq = c_zero
+        for chunk in range_constexpr(chunks):
+            idx = lane + chunk * lpr
+            valid = idx < ngroups
+            x = x_local[chunk].to(fx.Float32)
+            x2 = x * x
+            thread_sum = thread_sum + valid.select(x.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero)
+            thread_sumsq = thread_sumsq + valid.select(x2.reduce(ReductionOp.ADD, fastmath=fm_fast), c_zero)
+
+        tail_ok = []
+        x_tail = []
+        for j in range_constexpr(tail_iters):
+            ok = lane + j * lpr < tail
+            tail_ok.append(ok)
+            xv = in_row[ngroups * vec + ok.select(lane + j * lpr, 0)]
+            if const_expr(dtype_str != "f32"):
+                xv = xv.to(fx.Float32)
+            xv = ok.select(xv, c_zero)
+            x_tail.append(xv)
+            thread_sum = thread_sum + xv
+            thread_sumsq = thread_sumsq + xv * xv
+
+        sum_val, sumsq_val = row_reduce2(thread_sum, thread_sumsq)
+        mean = sum_val / n_float
+        var = sumsq_val / n_float - mean * mean
+        var = (var < c_zero).select(c_zero, var)
+        rstd = fmath.rsqrt(var + eps, fastmath=fm_fast)
+
+        # ── normalize + affine, tracking the row maximum of |y| ──
+        # ``y`` itself is not kept: the quantize pass rebuilds it from the
+        # cached row chunk and the cached affine parameters, which costs a few
+        # ALU ops but saves a whole row of live registers.
+        thread_max = c_zero
+        for chunk in range_constexpr(chunks):
+            idx = lane + chunk * lpr
+            valid = idx < ngroups
+            x = x_local[chunk].to(fx.Float32)
+            y = ((x - mean) * rstd) * g_local[chunk].to(fx.Float32) + b_local[chunk].to(fx.Float32)
+            y_abs = (y.bitcast(fx.Uint32) & abs_mask).bitcast(fx.Float32)
+            thread_max = fx.max(thread_max, valid.select(y_abs.reduce(ReductionOp.MAX), c_zero))
+        y_tail = []
+        for j in range_constexpr(tail_iters):
+            ok = tail_ok[j]
+            tix = ngroups * vec + ok.select(lane + j * lpr, 0)
+            gv = Gamma_buf[tix]
+            bv = Beta_buf[tix]
+            if const_expr(dtype_str != "f32"):
+                gv = gv.to(fx.Float32)
+                bv = bv.to(fx.Float32)
+            yv = ((x_tail[j] - mean) * rstd) * gv + bv
+            y_tail.append(yv)
+            yv_abs = (yv.bitcast(fx.Uint32) & fx.Uint32(0x7FFFFFFF)).bitcast(fx.Float32)
+            thread_max = fx.max(thread_max, ok.select(yv_abs, c_zero))
+
+        row_max = row_reduce_max(thread_max)
+        scale = row_max / c_qmax
+        final_scale = (scale == c_zero).select(c_one, scale)
+        if row_ok & (lane == 0):
+            YScale_buf[row_safe] = final_scale
+        inv_scale = c_one / final_scale
+
+        # ── quantize + store ──
+        for chunk in range_constexpr(chunks):
+            idx = lane + chunk * lpr
+            if row_ok & (idx < ngroups):
+                x = x_local[chunk].to(fx.Float32)
+                y = ((x - mean) * rstd) * g_local[chunk].to(fx.Float32) + b_local[chunk].to(fx.Float32)
+                _store_chunk(copy_atom_q, (y * inv_scale).to(quant_dtype), out_div, idx)
+        for j in range_constexpr(tail_iters):
+            if row_ok & tail_ok[j]:
+                out_idx = ngroups * vec + lane + j * lpr
+                out_row[out_idx] = (y_tail[j] * inv_scale).to(quant_dtype)
+
+    def _launch_layernorm_dynamicquant(
+        Input: fx.Tensor,
+        Gamma: fx.Tensor,
+        Beta: fx.Tensor,
+        Output: fx.Tensor,
+        YScale: fx.Tensor,
+        m_in: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        validate_norm_operand_dtypes(Input, dtype_str, Gamma=Gamma, Beta=Beta)
+        launcher = layernorm_dynamicquant_kernel(Input, Gamma, Beta, Output, YScale, m_in)
+        launcher.launch(
+            grid=((m_in + (rows - 1)) // rows, 1, 1),
+            block=(threads, 1, 1),
+            stream=stream,
+        )
+
+    # The quantization tolerances (|Δyscale| < 1e-3, |Δout| <= 1) leave room for
+    # the backend to contract to FMA and use the hardware reciprocal/rsqrt, which
+    # measurably shortens the reduction and normalize passes.
+    return JitFunction(_launch_layernorm_dynamicquant, compile_hints={"fastmath": "fast"})
+
+
 def build_layernorm_dynamicquant_module(
     N: int,
     dtype_str: str,
     quant_dtype_str: str = "i8",
     eps: float = EPS,
 ):
-    return _build_layernorm_quant_module(
-        N,
-        dtype_str,
-        is_smooth=False,
-        quant_dtype_str=quant_dtype_str,
-        eps=eps,
-    )
+    return _build_layernorm_dynamicquant(N, dtype_str, quant_dtype_str=quant_dtype_str, eps=eps)
 
 
 def build_layernorm_smoothquant_module(
