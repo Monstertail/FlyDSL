@@ -35,6 +35,62 @@ _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
 _B_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
 
 
+def _pick_cfg(M, N, K, a_dtype, b_dtype, blockscale, k_batch, hint, xcd_hint, batch):
+    """Pick (tile_m, tile_n, tile_k, n_waves, prefetch_group, xcd_swizzle) for this shape.
+
+    Two regimes. With M small the kernel is bound by how many B bytes it can keep in flight, so the
+    tile stays narrow (many CTAs, many outstanding loads) and the K loop is software-pipelined over
+    several K-tiles. With M large, B is re-read once per M tile, so the tile wants to be as square
+    as the accumulator budget allows and the CTA order is swizzled so that concurrent blocks share
+    operand lines in L2.
+    """
+    tk = 256 if K % 256 == 0 else (hint[2] if hint[2] in (128, 256) else 256)
+    fast = a_dtype == "fp4" and b_dtype == "fp4" and blockscale == "none" and k_batch == 1 and batch == 1
+    if not fast:
+        # Untuned dtypes / modes keep the historical hint-driven shape.
+        tk = hint[2] if hint[2] in (128, 256) else 256
+        tn = hint[1]
+        return hint[0], tn, tk, max(1, min(4, tn // 16)), 1, xcd_hint
+
+    m_rows = 32 * ((M + 31) // 32)
+    if m_rows <= 32:
+        tm, tn, nw, pf, xcd = 32, 32, 2, 8, 0
+    elif m_rows <= 64:
+        tm, tn, nw, pf, xcd = 32, 32, 2, 4, 2
+    elif m_rows <= 128:
+        tm, tn, nw, pf, xcd = 64, 64, 4, 4, 4
+    elif m_rows <= 2048:
+        tm, tn, nw, pf, xcd = 128, 128, 4, 1, 2
+    else:
+        tm, tn, nw, pf, xcd = 128, 256, 4, 1, 8
+
+    # A is re-read once per N tile, B once per M tile: with few M rows and a very long N the A
+    # re-reads dwarf B, so trade some of the surplus CTAs for a wider N tile.
+    if m_rows <= 64 and N >= 16384:
+        tn, nw, pf = 128, 4, 1
+
+    # With only a couple of K-tiles there is nothing to pipeline, so the kernel is bound by CTA
+    # count; halve the M tile to double parallelism (the reference shapes all pass this test).
+    if K // tk <= 2 and m_rows > 64:
+        tm = 64
+
+    # Keep the N tile inside N and let the wave count divide it.
+    while tn > 16 and N % tn:
+        tn //= 2
+    while nw > 1 and tn % (nw * 16):
+        nw //= 2
+    # per-wave accumulator budget: (BM/16)*(BN/nw/16) 16x16 f32 tiles <= 32 (128 VGPRs)
+    while nw < 8 and (tm // 16) * (tn // nw // 16) > 32:
+        nw *= 2
+    # A must cover one cooperative 16B round for all threads
+    while nw > 1 and tm * tk // 2 < nw * 64 * 16:
+        nw //= 2
+    k_tiles = K // tk
+    while pf > 1 and k_tiles % pf:
+        pf //= 2
+    return tm, tn, tk, nw, pf, xcd
+
+
 def _scale_mma_atoms(a_dtype, b_dtype):
     """16 (opsel_a, opsel_b) scaled-MFMA atoms; A elem is fp4/fp6/fp8, B is fp4/fp8."""
     elem_a = _A_ELEM[a_dtype]
@@ -64,7 +120,7 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
 
 
 @flyc.jit
-def launch_gemm(
+def _launch_gemm_cfg(
     arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
@@ -75,9 +131,11 @@ def launch_gemm(
     stream: fx.Stream,
     N: Constexpr[int],
     K: Constexpr[int],
-    tile_m: Constexpr[int],
-    tile_n: Constexpr[int],
-    tile_k: Constexpr[int],
+    BM: Constexpr[int],
+    BN: Constexpr[int],
+    BK: Constexpr[int],
+    N_WAVES: Constexpr[int],
+    PF: Constexpr[int],
     a_dtype: Constexpr[str],
     out_dtype: Constexpr[str],
     b_dtype: Constexpr[str],
@@ -100,7 +158,6 @@ def launch_gemm(
     addressing caller-controlled; each <0 keeps the contiguous [B,M,*] bmn default, all set =
     the [M,B,*] mbn layout. waves_per_eu<=0 = unset.
     """
-    BM, BN, BK = tile_m, tile_n, tile_k
     assert blockscale in ("none", "ab"), f"blockscale must be 'none' or 'ab', got {blockscale!r}"
     assert BK in (128, 256), f"tile_k must be 128 or 256 (tiles_per_chunk = 256 // tile_k), got {BK}"
     assert BM % 32 == 0, f"tile_m must be a multiple of 32 (the A e8m0 scale is 32-row granular), got {BM}"
@@ -138,7 +195,7 @@ def launch_gemm(
     # e8m0 scales are 256-K granular, B 128-K: tiles_per_chunk K-tiles share a word (hi/lo 16b = 128-K half).
     tiles_per_chunk = 256 // BK  # 1 for tile_k=256, 2 for tile_k=128
     m_chunks = BM // 16
-    num_waves = min(4, BN // 16)
+    num_waves = N_WAVES
     num_threads = num_waves * 64
     num_acc_n = (BN // num_waves) // 16  # 16-col n-subblocks per wave
     _bs_a = blockscale in ("a", "ab")
@@ -170,10 +227,24 @@ def launch_gemm(
     sched_num_ds_load = m_chunks * k_halves * a_ds_per
     sched_num_gmem = n_coop + num_acc_n * k_halves * B_BLK_PER_MMA + m_pairs + n_pairs
 
+    # K-tiles per software-pipelined group: the B/scale loads and the A DMA of group g+1 are
+    # issued before group g's MFMAs, so one group of compute time hides their latency. Bounded
+    # by the A double buffer (LDS) and by the B fragment registers carried across the loop.
+    n_b_frag = num_acc_n * k_halves
+    # Carry B fragments one K-tile ahead only when a tile's fragments stay within ~16 VGPRs;
+    # beyond that the register cost eats the occupancy and the pipelining loses.
+    roll_b = n_b_frag <= 4
+    assert k_tiles_local % PF == 0, f"prefetch group {PF} must divide {k_tiles_local} K-tiles"
+    n_groups = k_tiles_local // PF
+    A_GRP_B = A_LDS_B * PF
+    sched_mfma_total *= PF
+    sched_num_ds_load *= PF
+    sched_num_gmem *= PF
+
     @fx.struct
     class SharedA:
-        a0: fx.Array[Int8, A_LDS_B, 16]
-        a1: fx.Array[Int8, A_LDS_B, 16]
+        a0: fx.Array[Int8, A_GRP_B, 16]
+        a1: fx.Array[Int8, A_GRP_B, 16]
 
     @flyc.kernel
     def kernel_gemm(
@@ -268,8 +339,27 @@ def launch_gemm(
         def _lds_view(base_iter, off_i32):
             return fx.make_view(fx.add_offset(base_iter, off_i32), fx.make_layout(4, 1))
 
-        # Async A: gmem->LDS DMA (buffer_load_lds); issued after B/scale loads to overlap the MFMAs.
-        def dma_a_to_lds(kt, parity):
+        # Async A: gmem->LDS DMA (buffer_load_lds) for one group of PF K-tiles of A. The LDS
+        # destination offset equals the linear in-tile byte index, so a group is just PF tiles
+        # laid out back to back after the ping/pong base.
+        def dma_a_group(kt, parity):
+            base_off = rocdl.readfirstlane(T.i32, parity * lds_db + tid * 16)
+            for t in range_constexpr(PF):
+                base_k_byte = (kt + t) * A_ROW_B
+                for i in range_constexpr(n_coop):
+                    lin = (i * num_threads + tid) * 16
+                    row = lin // A_ROW_B
+                    col = lin % A_ROW_B
+                    if const_expr(swz_lds):
+                        col = col ^ ((row % k_blk16) * 16)
+                    gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
+                    lds_ptr = fx.add_offset(sA0_i8, base_off + t * A_LDS_B + i * (num_threads * 16))
+                    dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
+                    src = fx.slice(a_flat_div, (None, gmem_byte))
+                    fx.copy(dma_atom, src, dst)
+
+        def dma_a_tile(kt, parity):
+            # Single-tile A DMA: the reference formulation (wave-uniform base + pointer bumps).
             base_off = rocdl.readfirstlane(T.i32, parity * lds_db + wave * (64 * 16))
             lds_ptr = fx.add_offset(sA0_i8, base_off)
             base_k_byte = kt * A_ROW_B
@@ -292,31 +382,33 @@ def launch_gemm(
             fx.copy(lds_copy, _lds_view(base_iter, off_i32), t)
             return t
 
-        def read_a(parity):
-            base_iter = _iter_of(parity)
+        def read_a_frag(base_iter, mi, kh):
+            row = mi * 16 + lane_mod_16
+            row_base = row * A_ROW_I32
+            lo_blk = kh * (A_KH_I32 // 4) + lane_div_16 * (A_GK_I32 // 4)
+            if const_expr(swz_lds):
+                off = row_base + (lo_blk ^ (row % k_blk16)) * 4
+            else:
+                off = row_base + kh * A_KH_I32 + lane_div_16 * A_GK_I32
+            if const_expr(a_dtype == "fp4"):
+                return _read16(base_iter, off)
+            # fp6/fp8: pack two halves (64 K apart, f8f6f4 ABI) into i32[A_NDW].
+            if const_expr(swz_lds):
+                hi_off = row_base + ((lo_blk + A_HI_OFF // 4) ^ (row % k_blk16)) * 4
+            else:
+                hi_off = off + A_HI_OFF
+            lo = Vec(fx.memref_load_vec(_read16(base_iter, off)))
+            hi = Vec(fx.memref_load_vec(_read16(base_iter, hi_off)))
+            t = fx.make_rmem_tensor(A_NDW, Int32)
+            t.store(lo.shuffle(hi, list(range(A_NDW))))
+            return t
+
+        def read_a(parity, t=0):
+            base_iter = fx.add_offset(_iter_of(parity), fx.Int32(t * (A_LDS_B // 4)))
             av = []
             for mi in range_constexpr(m_chunks):
                 for kh in range_constexpr(k_halves):
-                    row = mi * 16 + lane_mod_16
-                    row_base = row * A_ROW_I32
-                    lo_blk = kh * (A_KH_I32 // 4) + lane_div_16 * (A_GK_I32 // 4)
-                    if const_expr(swz_lds):
-                        off = row_base + (lo_blk ^ (row % k_blk16)) * 4
-                    else:
-                        off = row_base + kh * A_KH_I32 + lane_div_16 * A_GK_I32
-                    if const_expr(a_dtype == "fp4"):
-                        av.append(_read16(base_iter, off))
-                    else:
-                        # fp6/fp8: pack two halves (64 K apart, f8f6f4 ABI) into i32[A_NDW].
-                        if const_expr(swz_lds):
-                            hi_off = row_base + ((lo_blk + A_HI_OFF // 4) ^ (row % k_blk16)) * 4
-                        else:
-                            hi_off = off + A_HI_OFF
-                        lo = Vec(fx.memref_load_vec(_read16(base_iter, off)))
-                        hi = Vec(fx.memref_load_vec(_read16(base_iter, hi_off)))
-                        t = fx.make_rmem_tensor(A_NDW, Int32)
-                        t.store(lo.shuffle(hi, list(range(A_NDW))))
-                        av.append(t)
+                    av.append(read_a_frag(base_iter, mi, kh))
             return av
 
         n_col_base = by_n + wave * (BN // num_waves)
@@ -364,7 +456,7 @@ def launch_gemm(
 
         n_acc = m_chunks * num_acc_n
 
-        def load_b(kt):
+        def load_b_tile(kt):
             # buffer_load_dwordx4 into i32[4] frags; fp8 B packs two K0 blocks (lo/hi, 64 K
             # apart, f8f6f4 ABI) into i32[8] — same shuffle as read_a's fp6/fp8 A path.
             ops = []
@@ -382,7 +474,7 @@ def launch_gemm(
                         ops.append(t)
             return ops
 
-        def load_sc(chunk_kt):
+        def load_sc_tile(chunk_kt):
             # (sa, sb) e8m0 words per m-/n-pair for one 256-K chunk (uniform base -> SGPR soffset).
             # blockscale uses smaller per-chunk strides (compact buffer) + broadcast lanes.
             koff_a = chunk_kt * _sc_k0_a
@@ -435,7 +527,9 @@ def launch_gemm(
             if const_expr(scale_shift is not None):
                 sa_v = [v.shrui(scale_shift) for v in sa_v]
                 sb_v = [v.shrui(scale_shift) for v in sb_v]
-            if const_expr(BN < 128):
+            if const_expr(BN // num_waves < 32):
+                # 16-column wave tiles: the e8m0 word packs two 16-column groups, so the odd
+                # group reads the high 16-bit half.
                 _bnsh = ((by_n + wave * (BN // num_waves)) % 32) // 16 * 8
                 sb_v = [v.shrui(_bnsh) for v in sb_v]
             # kh OUTERMOST: consecutive MFMAs hit distinct accumulators (dense issue). Each
@@ -472,30 +566,113 @@ def launch_gemm(
 
         accs_init = [fx.full(4, 0.0, Float32).ir_value() for _ in range_constexpr(n_acc)]
 
-        dma_a_to_lds(kt0, fx.Int32(0))
-        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
-        gpu.barrier()
-        for iv, state in range(0, k_tiles_local, 1, init=accs_init):
-            accs = list(state)
-            ivi = fx.Int32(iv)
-            cur = ivi % 2
-            nxt = (ivi + 1) % 2
-            kt = kt0 + ivi  # absolute K-tile for A/B/scale addressing
-            nkt = ivi + 1
-            # clamp last-iter prefetch to the local last tile, then rebase to absolute
-            pf_kt = kt0 + (nkt - nkt // k_tiles_local)
-            chunk_kt = kt if tiles_per_chunk == 1 else kt // tiles_per_chunk
-            scale_shift = None if tiles_per_chunk == 1 else (kt % tiles_per_chunk) * 16
-            av = read_a(cur)
-            bv = load_b(kt)
-            sa_v, sb_v = load_sc(chunk_kt)
-            dma_a_to_lds(pf_kt, nxt)  # A DMA after B/scale loads -> overlaps the MFMAs
-            accs = compute(accs, av, bv, sa_v, sb_v, scale_shift)
-            hot_loop_scheduler()
-            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)  # drain the A DMA before the barrier
+        def _frag(vals, ndw):
+            ts = []
+            for v in vals:
+                t = fx.make_rmem_tensor(ndw, Int32)
+                t.store(Vec(v))
+                ts.append(t)
+            return ts
+
+        def prefetch_group(gkt):
+            """Issue B (buffer_load_dwordx4) + e8m0 scale loads for the PF tiles of one group.
+
+            Returns the flattened carried values (B fragments, then A scales, then B scales) so the
+            caller can stash them in the loop state and consume them one group later."""
+            bvals, savals, sbvals = [], [], []
+            for t in range_constexpr(PF):
+                kt = gkt + t
+                for frag in load_b_tile(kt):
+                    bvals.append(fx.memref_load_vec(frag).ir_value())
+                chunk_kt = kt if tiles_per_chunk == 1 else kt // tiles_per_chunk
+                sa_t, sb_t = load_sc_tile(chunk_kt)
+                savals.extend(sa_t)
+                sbvals.extend(sb_t)
+            return bvals, savals, sbvals
+
+        if const_expr(PF == 1):
+            # Tag-along pipeline: one K-tile per iteration, loads issued inside the iteration and
+            # drained before the barrier. Best when the loop is MFMA-bound (each iteration already
+            # has enough compute to cover the load latency).
+            dma_a_tile(kt0, fx.Int32(0))
+            # The e8m0 words for tile 0 are tiny but latency-bound: keep them in the loop state so
+            # each iteration consumes the words fetched a tile earlier.
+            sa_c, sb_c = load_sc_tile(kt0 if tiles_per_chunk == 1 else kt0 // tiles_per_chunk)
+            b_c = [fx.memref_load_vec(t).ir_value() for t in load_b_tile(kt0)] if roll_b else []
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
             gpu.barrier()
-            results = yield accs
-        accs = results
+            for iv, state in range(0, k_tiles_local, 1, init=accs_init + sa_c + sb_c + b_c):
+                accs = list(state[0:n_acc])
+                sa_v = state[n_acc : n_acc + m_pairs]
+                sb_v = state[n_acc + m_pairs : n_acc + m_pairs + n_pairs]
+                if const_expr(roll_b):
+                    bv = _frag(state[n_acc + m_pairs + n_pairs :], B_NDW)
+                ivi = fx.Int32(iv)
+                cur = ivi % 2
+                nxt = (ivi + 1) % 2
+                kt = kt0 + ivi
+                nkt = ivi + 1
+                pf_kt = kt0 + (nkt - nkt // k_tiles_local)
+                pchunk = pf_kt if tiles_per_chunk == 1 else pf_kt // tiles_per_chunk
+                scale_shift = None if tiles_per_chunk == 1 else (kt % tiles_per_chunk) * 16
+                av = read_a(cur)
+                if const_expr(roll_b):
+                    b_n = [fx.memref_load_vec(t).ir_value() for t in load_b_tile(pf_kt)]
+                else:
+                    bv = load_b_tile(kt)
+                    b_n = []
+                sa_n, sb_n = load_sc_tile(pchunk)
+                dma_a_tile(pf_kt, nxt)  # A DMA after B/scale loads -> overlaps the MFMAs
+                accs = compute(accs, av, bv, sa_v, sb_v, scale_shift)
+                hot_loop_scheduler()
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)  # drain the A DMA before the barrier
+                gpu.barrier()
+                results = yield accs + sa_n + sb_n + b_n
+            accs = list(results[0:n_acc])
+        else:
+            # Group pipeline: the next group's B/scale/A traffic is issued before this group's
+            # MFMAs and only drained at the barrier, so PF tiles of compute hide the latency.
+            dma_a_group(kt0, fx.Int32(0))
+            b0, sa0, sb0 = prefetch_group(kt0)
+            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
+            gpu.barrier()
+            nb_g = PF * n_b_frag
+            na_g = PF * m_pairs
+            state_init = accs_init + b0 + sa0 + sb0
+            for ig, state in range(0, n_groups, 1, init=state_init):
+                accs = list(state[0:n_acc])
+                bvals = state[n_acc : n_acc + nb_g]
+                savals = state[n_acc + nb_g : n_acc + nb_g + na_g]
+                sbvals = state[n_acc + nb_g + na_g :]
+                igi = fx.Int32(ig)
+                cur = igi % 2
+                nxt = (igi + 1) % 2
+                gkt = kt0 + igi * PF  # absolute first K-tile of this group
+                ngi = igi + 1
+                # clamp the last-group prefetch back onto the local first group (re-reads it)
+                pf_gkt = kt0 + (ngi - ngi // n_groups) * PF
+                # Issue the next group's global traffic first: it overlaps this group's MFMAs.
+                dma_a_group(pf_gkt, nxt)
+                b1, sa1, sb1 = prefetch_group(pf_gkt)
+                # Rolling A: read the next tile's A fragments from LDS before this tile's MFMAs so
+                # the LDS latency is covered by a tile of compute instead of stalling on it.
+                av_next = read_a(cur, 0)
+                for t in range_constexpr(PF):
+                    av = av_next
+                    if const_expr(t + 1 < PF):
+                        av_next = read_a(cur, t + 1)
+                    bv = _frag(bvals[t * n_b_frag : (t + 1) * n_b_frag], B_NDW)
+                    sa_v = savals[t * m_pairs : (t + 1) * m_pairs]
+                    sb_v = sbvals[t * n_pairs : (t + 1) * n_pairs]
+                    scale_shift = (
+                        None if tiles_per_chunk == 1 else ((fx.Int32(gkt) + fx.Int32(t)) % tiles_per_chunk) * 16
+                    )
+                    accs = compute(accs, av, bv, sa_v, sb_v, scale_shift)
+                hot_loop_scheduler()
+                rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)  # drain next-group loads before the barrier
+                gpu.barrier()
+                results = yield accs + b1 + sa1 + sb1
+            accs = list(results[0:n_acc])
 
         # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row m*16+(l//16)*4+ii, col
         # base+l%16), c_stride apart.
@@ -566,6 +743,81 @@ def launch_gemm(
         i32_n,
         value_attrs={"rocdl.waves_per_eu": wpe},
     ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+
+
+def launch_gemm(
+    arg_c,
+    arg_a,
+    arg_b,
+    arg_scale_a,
+    arg_scale_b,
+    i32_m,
+    i32_n,
+    stream,
+    N,
+    K,
+    tile_m,
+    tile_n,
+    tile_k,
+    a_dtype,
+    out_dtype,
+    b_dtype,
+    batch,
+    a_row_stride,
+    a_batch_stride,
+    sca_row_stride,
+    sca_batch_stride,
+    c_row_stride,
+    c_batch_stride,
+    waves_per_eu,
+    xcd_swizzle=0,
+    k_batch=1,
+    blockscale="none",
+):
+    """Host-side entry point: pick a tile shape for this problem and launch the FlyDSL kernel.
+
+    Keeps the `launch_gemm` signature of the kernel (raw pointers + compile-time constants) while
+    choosing tile_m/tile_n/n_waves/prefetch depth from the M/N/K it is given.
+    """
+    try:
+        M = int(i32_m)
+        tm, tn, tk, nw, pf, xcd = _pick_cfg(
+            M, N, K, a_dtype, b_dtype, blockscale, k_batch, (tile_m, tile_n, tile_k), xcd_swizzle, batch
+        )
+    except (TypeError, ValueError):
+        # Non-integer M (dynamic launch): fall back to the caller's tile hints.
+        tm, tn, tk, nw, pf, xcd = tile_m, tile_n, tile_k, max(1, min(4, tile_n // 16)), 1, xcd_swizzle
+    _launch_gemm_cfg(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        i32_m,
+        i32_n,
+        stream,
+        N,
+        K,
+        tm,
+        tn,
+        tk,
+        nw,
+        pf,
+        a_dtype,
+        out_dtype,
+        b_dtype,
+        batch,
+        a_row_stride,
+        a_batch_stride,
+        sca_row_stride,
+        sca_batch_stride,
+        c_row_stride,
+        c_batch_stride,
+        waves_per_eu,
+        xcd,
+        k_batch,
+        blockscale,
+    )
 
 
 # ── split-K reduce ────────────────────────────────────────────────────────────
